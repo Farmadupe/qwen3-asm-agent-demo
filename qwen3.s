@@ -3,6 +3,9 @@
 #   stdin     prefix as little-endian u32 token IDs (read until EOF)
 #   stdout    generated token IDs as little-endian u32, one write() per token
 #   argv[1]   optional cap on generated tokens (default: until EOS or context full)
+#   argv[2]   optional; nonzero makes the engine write, for every position it computes
+#             (every prefix token, then every decoded token that is fed back), the
+#             VOCAB f32 logits (little endian, 4*VOCAB bytes, no delimiter) to stderr
 #   exit      0 ok, 1 usage, 2 weights missing/mismatched, 3 read error,
 #             4 bad prefix, 5 write error, 6 out of memory
 #
@@ -87,6 +90,13 @@ _start:
     test rdx, rdx
     jnz .Lusage
     mov [rip+g_max_new], rax
+    cmp qword ptr [rsp], 3
+    jb .Lnoarg
+    mov rdi, [rsp+24]                    # argv[2]: emit logits on stderr if nonzero
+    call parse_decimal
+    test rdx, rdx
+    jnz .Lusage
+    mov [rip+g_emit], rax
 .Lnoarg:
 
     # --- locate the weight trailer at the end of /proc/self/exe -------------
@@ -1331,10 +1341,19 @@ forward:
     jb .Lfw_layer
 
     # ---- final norm + tied LM head (logits = embed . xn) --------------------
+    # Normally only for the last token (want); with g_emit, for every token,
+    # each one's logits written to stderr.
+    mov rbx, [rip+g_fw_nb]
+    dec rbx                              # b = nb-1: only the last token
+    cmp qword ptr [rip+g_emit], 0
+    je .Lfw_head_want
+    xor ebx, ebx                         # b = 0: every token
+    jmp .Lfw_head
+.Lfw_head_want:
     cmp qword ptr [rip+g_fw_want], 0
     je .Lfw_ret
-    mov rax, [rip+g_fw_nb]
-    dec rax
+.Lfw_head:
+    mov rax, rbx
     shl rax, 12
     lea rsi, [rip+g_x]
     add rsi, rax
@@ -1351,7 +1370,27 @@ forward:
     mov r9d, 1
     call matvec
 
-    lea rdi, [rip+g_logits]
+    cmp qword ptr [rip+g_emit], 0
+    je .Lfw_head_next
+    lea rsi, [rip+g_logits]              # write(2, logits, VOCAB*4)
+    mov edx, VOCAB*4
+.Lfw_elog:
+    mov edi, 2
+    mov eax, 1
+    syscall
+    test rax, rax
+    jle .Lfw_elog_fail
+    add rsi, rax
+    sub rdx, rax
+    jnz .Lfw_elog
+.Lfw_head_next:
+    inc rbx
+    cmp rbx, [rip+g_fw_nb]
+    jb .Lfw_head
+    cmp qword ptr [rip+g_fw_want], 0
+    je .Lfw_ret
+
+    lea rdi, [rip+g_logits]              # g_logits holds the last token's logits
     mov esi, VOCAB
     call argmax
     mov [rip+g_next], eax
@@ -1364,6 +1403,10 @@ forward:
     pop rbp
     pop rbx
     ret
+.Lfw_elog_fail:
+    mov edi, 5                           # stderr is gone: exit quietly
+    mov eax, 231
+    syscall
 
 # ==========================================================================
 .section .rodata
@@ -1373,7 +1416,7 @@ magic_trl:   .ascii "QWN3TRL1"
 .align 4
 expect_cfg:  .long VOCAB, H, NL, NH, NKV, HD, FF, MAXCTX
 
-msg_usage:      .asciz "usage: qwen3 [max_new_tokens] < prefix.u32 > tokens.u32\n"
+msg_usage:      .asciz "usage: qwen3 [max_new_tokens [emit_logits]] < prefix.u32 > tokens.u32\n"
 msg_no_weights: .asciz "error: no weight blob attached to this executable (run build.sh)\n"
 msg_mmap:       .asciz "error: mmap of weight blob failed\n"
 msg_bad_blob:   .asciz "error: weight blob does not match this engine's configuration\n"
@@ -1423,6 +1466,7 @@ g_pos:      .skip 8
 g_ntok:     .skip 8
 g_next:     .skip 8
 g_outbuf:   .skip 8
+g_emit:     .skip 8
 g_fw_tok:   .skip 8
 g_fw_p0:    .skip 8
 g_fw_nb:    .skip 8
