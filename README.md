@@ -1,0 +1,1 @@
+A Qwen3-0.6B text generator written in x86-64 assembly, with weights attached to the engine binary. To run it, execute `./inference.py "Your prefix here"`, which downloads the weights and builds the engine on first use, then streams the continuation.
